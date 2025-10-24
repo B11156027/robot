@@ -1,0 +1,141 @@
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
+
+const char* ssid = "123";
+const char* password = "123456789";
+AsyncWebServer server(80);
+
+// 眼睛
+const int eyeChannel = 0;
+const int eyeOpen = 130;
+const int eyeClose = 180;
+const int blinkDelay = 4000;
+const int blinkSpeed = 150;
+
+// 嘴巴
+const int mouthChannel = 4;
+const int mouthClosed = 180;
+const int mouthOpen = 130;
+const int mouthMoveDelay = 200; // 嘴巴開合時間 (ms)
+
+bool isTalking = false;
+bool mouthIsOpen = false;
+unsigned long lastMouthMove = 0;
+
+// ===== 頭部 =====
+const int headChannel = 8;
+const int headLeft = 1;
+const int headRight = 179;
+const int headCenter = 70;
+
+int headCurrent = headCenter;   // 目前角度
+int headTarget = headCenter;    // 目標角度
+const int headStep = 2;         // 每次最多移動 2°
+const int headInterval = 30;    // 每 30ms 更新一次
+unsigned long lastHeadUpdate = 0;
+
+// PWM 設定
+const int SERVO_MIN = 500;
+const int SERVO_MAX = 2400;
+int angleToPWM(int angle) {
+  return map(angle, 0, 180, SERVO_MIN * 4096 / 20000, SERVO_MAX * 4096 / 20000);
+}
+
+// 眨眼計時
+unsigned long lastBlink = 0;
+
+void updateMouth() {
+  if (!isTalking) return;
+
+  unsigned long now = millis();
+  if (mouthIsOpen) {
+    if (now - lastMouthMove >= mouthMoveDelay) {
+      pwm.setPWM(mouthChannel, 0, angleToPWM(mouthClosed));
+      mouthIsOpen = false;
+      lastMouthMove = now;
+    }
+  } else {
+    if (now - lastMouthMove >= mouthMoveDelay) {
+      pwm.setPWM(mouthChannel, 0, angleToPWM(mouthOpen));
+      mouthIsOpen = true;
+      lastMouthMove = now;
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+  pwm.begin();
+  pwm.setPWMFreq(50);
+  delay(10);
+
+  pwm.setPWM(eyeChannel, 0, angleToPWM(eyeOpen));
+  pwm.setPWM(mouthChannel, 0, angleToPWM(mouthClosed));
+  pwm.setPWM(headChannel, 0, angleToPWM(headCenter));
+
+  // WiFi
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.print("Connected! IP address: ");
+  Serial.println(WiFi.localIP());
+
+  // HTTP控制：設定目標角度
+  server.on("/servo", HTTP_GET, [](AsyncWebServerRequest *request){
+    if(request->hasParam("angle")){
+      int angle = request->getParam("angle")->value().toInt();
+      if (angle < headLeft) angle = headLeft;
+      if (angle > headRight) angle = headRight;
+      headTarget = angle;  // ✅ 不直接 setPWM，改成設定目標角度
+      request->send(200, "text/plain", String("Head target set to: ") + angle);
+    } else {
+      request->send(400, "text/plain", "Missing angle");
+    }
+  });
+  server.begin();
+  Serial.println("HTTP 伺服器啟動完成");
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // 👁️ 眨眼
+  if (now - lastBlink >= blinkDelay) {
+    pwm.setPWM(eyeChannel, 0, angleToPWM(eyeClose));
+    delay(blinkSpeed);
+    pwm.setPWM(eyeChannel, 0, angleToPWM(eyeOpen));
+    lastBlink = now;
+  }
+
+  // 🎙️ 嘴巴同步（Serial控制）
+  if (Serial.available()) {
+    char cmd = Serial.read();
+    if (cmd == 'S') {
+      isTalking = true;
+    } else if (cmd == 'E') {
+      isTalking = false;
+      pwm.setPWM(mouthChannel, 0, angleToPWM(mouthClosed));
+    }
+  }
+
+  updateMouth(); 
+
+  // 🌀 頭部限速移動
+  if (now - lastHeadUpdate >= headInterval) {
+    if (headCurrent < headTarget) {
+      headCurrent = min(headCurrent + headStep, headTarget);
+    } else if (headCurrent > headTarget) {
+      headCurrent = max(headCurrent - headStep, headTarget);
+    }
+    pwm.setPWM(headChannel, 0, angleToPWM(headCurrent));
+    lastHeadUpdate = now;
+  }
+}
